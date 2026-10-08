@@ -1,7 +1,7 @@
 import array
 import base64
 from types import SimpleNamespace
-from typing import Any, cast
+from typing import Any, Literal, cast
 
 import pytest
 from google.genai import types as genai_types
@@ -863,6 +863,10 @@ def _build_embedding_settings(
         "EMBEDDING_MODEL_CONFIG__ENCODING_FORMAT_MODE",
         "EMBEDDING_MODEL_CONFIG__OVERRIDES__BASE_URL",
         "EMBEDDING_MODEL_CONFIG__MAX_BATCH_SIZE",
+        "EMBEDDING_MODEL_CONFIG__QUERY_PREFIX",
+        "EMBEDDING_MODEL_CONFIG__QUERY_SUFFIX",
+        "EMBEDDING_MODEL_CONFIG__DOCUMENT_PREFIX",
+        "EMBEDDING_MODEL_CONFIG__DOCUMENT_SUFFIX",
     ):
         monkeypatch.delenv(key, raising=False)
     for key, value in env.items():
@@ -1188,9 +1192,11 @@ async def test_public_embedding_client_forwards_on_oversize(
             texts: list[str],
             *,
             on_oversize: str = "raise",
+            input_type: str = "document",
         ) -> list[list[float]]:
             captured["texts"] = texts
             captured["on_oversize"] = on_oversize
+            captured["input_type"] = input_type
             return [[0.1]]
 
     wrapper = EmbeddingClient()
@@ -1201,6 +1207,7 @@ async def test_public_embedding_client_forwards_on_oversize(
     assert out == [[0.1]]
     assert captured["texts"] == ["hi"]
     assert captured["on_oversize"] == "truncate"
+    assert captured["input_type"] == "document"
 
 
 def test_prepare_chunks_returns_ordered_chunks(
@@ -1407,3 +1414,407 @@ async def test_provider_dimension_mismatch_is_not_a_token_limit_error(
         await client.embed("short query")
 
     assert not isinstance(excinfo.value, EmbeddingTokenLimitError)
+
+
+# --- Per-side input templates (prefix + suffix) ------------------------------
+#
+# Chat-template embedding models with last-token pooling (Qwen3-Embedding,
+# Qwen3-VL-Embedding) need every input wrapped as prefix + text + suffix, with
+# a different template for queries and documents.
+
+QUERY_PREFIX = (
+    "<|im_start|>system\nGiven a search query, retrieve relevant memories or "
+    + "conversation messages that help answer it.<|im_end|>\n<|im_start|>user\n"
+)
+QUERY_SUFFIX = "<|im_end|>\n<|im_start|>assistant\n"
+DOCUMENT_PREFIX = (
+    "<|im_start|>system\nRepresent the user's input.<|im_end|>\n<|im_start|>user\n"
+)
+DOCUMENT_SUFFIX = "<|im_end|>\n<|im_start|>assistant\n"
+
+
+def _templated_config(transport: Literal["openai", "gemini"] = "openai") -> Any:
+    return EmbeddingModelConfig(
+        transport=transport,
+        model="qwen3-vl-embedding-2b"
+        if transport == "openai"
+        else "gemini-embedding-001",
+        api_key="test-key",
+        query_prefix=QUERY_PREFIX,
+        query_suffix=QUERY_SUFFIX,
+        document_prefix=DOCUMENT_PREFIX,
+        document_suffix=DOCUMENT_SUFFIX,
+    )
+
+
+def _build_templated_client(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    max_input_tokens: int = 8192,
+    max_tokens_per_request: int = 300_000,
+    config: EmbeddingModelConfig | None = None,
+) -> tuple[_EmbeddingClient, FakeOpenAIEmbeddingsAPI]:
+    fake_embeddings = FakeOpenAIEmbeddingsAPI([0.1] * 4)
+
+    class FakeOpenAIClient:
+        def __init__(self, *, api_key: str | None, base_url: str | None) -> None:
+            self.embeddings: FakeOpenAIEmbeddingsAPI = fake_embeddings
+
+    monkeypatch.setattr("openai.AsyncOpenAI", FakeOpenAIClient)
+
+    client = _EmbeddingClient(
+        config or _templated_config(),
+        vector_dimensions=4,
+        max_input_tokens=max_input_tokens,
+        max_tokens_per_request=max_tokens_per_request,
+        send_dimensions=False,
+    )
+    return client, fake_embeddings
+
+
+def _count(client: _EmbeddingClient, text: str) -> int:
+    return len(client.encoding.encode(text, disallowed_special=()))
+
+
+def _overhead(client: _EmbeddingClient, prefix: str, suffix: str) -> int:
+    return _count(client, prefix) + _count(client, suffix)
+
+
+def _cap_with_document_budget(
+    monkeypatch: pytest.MonkeyPatch, document_budget: int
+) -> int:
+    """`max_input_tokens` leaving `document_budget` raw tokens per document.
+
+    The cap also has to admit the (longer) query template, or construction
+    fails before the document side can be exercised.
+    """
+    probe, _ = _build_templated_client(monkeypatch)
+    query_overhead = _overhead(probe, QUERY_PREFIX, QUERY_SUFFIX)
+    document_overhead = _overhead(probe, DOCUMENT_PREFIX, DOCUMENT_SUFFIX)
+    assert query_overhead - document_overhead < document_budget
+    return document_overhead + document_budget
+
+
+@pytest.mark.asyncio
+async def test_embed_wraps_query_by_default_and_document_on_request(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client, fake = _build_templated_client(monkeypatch)
+
+    await client.embed("who is alice", input_type="query")
+    await client.embed("alice lives in berlin", input_type="document")
+    await client.embed("default side")
+
+    assert fake.calls[0]["input"] == [QUERY_PREFIX + "who is alice" + QUERY_SUFFIX]
+    assert fake.calls[1]["input"] == [
+        DOCUMENT_PREFIX + "alice lives in berlin" + DOCUMENT_SUFFIX
+    ]
+    assert fake.calls[2]["input"] == [QUERY_PREFIX + "default side" + QUERY_SUFFIX]
+
+
+@pytest.mark.asyncio
+async def test_simple_batch_embed_wraps_documents_by_default_and_queries_on_request(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client, fake = _build_templated_client(monkeypatch)
+
+    await client.simple_batch_embed(["one", "two"])
+    await client.simple_batch_embed(["what does she want"], input_type="query")
+
+    assert fake.calls[0]["input"] == [
+        DOCUMENT_PREFIX + "one" + DOCUMENT_SUFFIX,
+        DOCUMENT_PREFIX + "two" + DOCUMENT_SUFFIX,
+    ]
+    assert fake.calls[1]["input"] == [
+        QUERY_PREFIX + "what does she want" + QUERY_SUFFIX
+    ]
+
+
+@pytest.mark.asyncio
+async def test_no_template_configured_sends_raw_texts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Default config must put byte-identical input on the wire to before."""
+    client, fake = _build_templated_client(
+        monkeypatch,
+        config=EmbeddingModelConfig(
+            transport="openai", model="text-embedding-3-small", api_key="test-key"
+        ),
+    )
+
+    await client.embed("plain query", input_type="query")
+    await client.embed("plain doc", input_type="document")
+    await client.simple_batch_embed(["a", "b"], input_type="document")
+    await client.simple_batch_embed(["q"], input_type="query")
+    await client.batch_embed({"x": "chunk me"}, input_type="document")
+
+    assert [call["input"] for call in fake.calls] == [
+        ["plain query"],
+        ["plain doc"],
+        ["a", "b"],
+        ["q"],
+        ["chunk me"],
+    ]
+
+
+@pytest.mark.asyncio
+async def test_embed_rejects_text_that_only_overflows_once_wrapped(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    probe, _ = _build_templated_client(monkeypatch)
+    overhead = _overhead(probe, QUERY_PREFIX, QUERY_SUFFIX)
+    max_input_tokens = overhead + 10
+    client, fake = _build_templated_client(
+        monkeypatch, max_input_tokens=max_input_tokens
+    )
+
+    text = " ".join(["word"] * 15)
+    raw_tokens = _count(client, text)
+    assert 10 < raw_tokens <= max_input_tokens, "must fit raw but not wrapped"
+
+    with pytest.raises(
+        EmbeddingTokenLimitError, match="maximum token limit of 10 tokens"
+    ):
+        await client.embed(text, input_type="query")
+    assert fake.calls == []
+
+
+@pytest.mark.asyncio
+async def test_truncate_keeps_wrapped_payload_within_cap_and_suffix_intact(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    max_input_tokens = _cap_with_document_budget(monkeypatch, 20)
+    client, fake = _build_templated_client(
+        monkeypatch, max_input_tokens=max_input_tokens
+    )
+
+    text = " ".join(f"word{i}" for i in range(15))
+    assert 20 < _count(client, text) <= max_input_tokens, "fits raw, not wrapped"
+
+    await client.simple_batch_embed(
+        [text], on_oversize="truncate", input_type="document"
+    )
+
+    sent = fake.calls[0]["input"][0]
+    assert sent.startswith(DOCUMENT_PREFIX)
+    assert sent.endswith(DOCUMENT_SUFFIX)
+    assert _count(client, sent) <= max_input_tokens
+    body = sent[len(DOCUMENT_PREFIX) : -len(DOCUMENT_SUFFIX)]
+    assert body and text.startswith(body)
+
+
+def test_public_truncate_uses_template_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Routers truncate search queries before embed(); the result must then pass
+    embed()'s budget check rather than being rejected after wrapping."""
+    probe, _ = _build_templated_client(monkeypatch)
+    overhead = _overhead(probe, QUERY_PREFIX, QUERY_SUFFIX)
+    client, _ = _build_templated_client(monkeypatch, max_input_tokens=overhead + 10)
+
+    truncated, tokens = client.truncate_to_token_limit(
+        " ".join(f"word{i}" for i in range(40)), input_type="query"
+    )
+
+    assert tokens <= 10
+    assert _count(client, QUERY_PREFIX + truncated + QUERY_SUFFIX) <= overhead + 10
+
+
+@pytest.mark.asyncio
+async def test_prepare_chunks_sizes_to_template_budget_and_batch_embed_wraps(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    max_input_tokens = _cap_with_document_budget(monkeypatch, 20)
+    client, fake = _build_templated_client(
+        monkeypatch, max_input_tokens=max_input_tokens
+    )
+    long_text = " ".join(f"word{i}" for i in range(25))
+    # Fits the raw cap in one piece, so any split is down to the template.
+    assert _count(client, long_text) <= max_input_tokens
+
+    chunks = client.prepare_chunks({"m": long_text}, input_type="document")["m"]
+
+    assert len(chunks) > 1
+    for chunk in chunks:
+        # Persisted chunks never carry template text...
+        assert "<|im_start|>" not in chunk
+        # ...and are sized so the wrapped form still fits the model cap.
+        assert _count(client, chunk) <= 20
+        assert (
+            _count(client, DOCUMENT_PREFIX + chunk + DOCUMENT_SUFFIX)
+            <= max_input_tokens
+        )
+
+    await client.batch_embed({"m": long_text}, input_type="document")
+
+    assert fake.calls[0]["input"] == [
+        DOCUMENT_PREFIX + chunk + DOCUMENT_SUFFIX for chunk in chunks
+    ]
+
+
+@pytest.mark.asyncio
+async def test_request_token_cap_counts_wrapped_tokens(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Two texts whose raw tokens fit one request but whose wrapped tokens do
+    not must be split across two requests."""
+    probe, _ = _build_templated_client(monkeypatch)
+    overhead = _overhead(probe, DOCUMENT_PREFIX, DOCUMENT_SUFFIX)
+    client, fake = _build_templated_client(
+        monkeypatch, max_tokens_per_request=overhead + 10
+    )
+
+    await client.simple_batch_embed(["alpha", "beta"], input_type="document")
+
+    assert [len(call["input"]) for call in fake.calls] == [1, 1]
+
+
+@pytest.mark.asyncio
+async def test_telemetry_reports_wrapped_token_estimate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    published: list[int] = []
+
+    def capture(**kwargs: Any) -> None:
+        published.append(kwargs["input_tokens_estimate"])
+
+    monkeypatch.setattr("src.embedding_client._publish_embedding_event", capture)
+    client, _ = _build_templated_client(monkeypatch)
+
+    await client.embed("hello world", input_type="query")
+    await client.simple_batch_embed(["hello world"], input_type="document")
+
+    assert published == [
+        _count(client, QUERY_PREFIX + "hello world" + QUERY_SUFFIX),
+        _count(client, DOCUMENT_PREFIX + "hello world" + DOCUMENT_SUFFIX),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_gemini_paths_send_wrapped_contents(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[Any] = []
+
+    class FakeGeminiModels:
+        async def embed_content(
+            self, *, contents: Any, **_kwargs: Any
+        ) -> SimpleNamespace:
+            calls.append(contents)
+            count = len(cast(list[Any], contents)) if isinstance(contents, list) else 1
+            return SimpleNamespace(
+                embeddings=[SimpleNamespace(values=[0.3] * 4) for _ in range(count)]
+            )
+
+    class FakeGeminiClient:
+        def __init__(self, *, api_key: str | None, http_options: Any) -> None:
+            self.aio: Any = SimpleNamespace(models=FakeGeminiModels())
+
+    monkeypatch.setattr("google.genai.Client", FakeGeminiClient)
+
+    client = _EmbeddingClient(
+        _templated_config("gemini"),
+        vector_dimensions=4,
+        max_input_tokens=2048,
+        max_tokens_per_request=300_000,
+        send_dimensions=False,
+    )
+
+    await client.embed("who is alice", input_type="query")
+    await client.simple_batch_embed(["alice lives in berlin"], input_type="document")
+
+    assert calls[0] == QUERY_PREFIX + "who is alice" + QUERY_SUFFIX
+    assert gemini_call_texts(calls[1]) == [
+        DOCUMENT_PREFIX + "alice lives in berlin" + DOCUMENT_SUFFIX
+    ]
+
+
+def test_template_that_consumes_the_whole_budget_raises_at_construction(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    probe, _ = _build_templated_client(monkeypatch)
+    overhead = _overhead(probe, QUERY_PREFIX, QUERY_SUFFIX)
+
+    with pytest.raises(ValueError, match="query template uses"):
+        _build_templated_client(monkeypatch, max_input_tokens=overhead)
+
+
+@pytest.mark.asyncio
+async def test_public_embedding_client_forwards_input_type(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, object] = {}
+
+    class FakeInner:
+        async def embed(self, _query: str, *, input_type: str) -> list[float]:
+            captured["embed"] = input_type
+            return [0.1]
+
+        async def simple_batch_embed(
+            self, _texts: list[str], *, input_type: str, **_kwargs: object
+        ) -> list[list[float]]:
+            captured["simple_batch_embed"] = input_type
+            return [[0.1]]
+
+        async def batch_embed(
+            self, _id_resource_dict: dict[str, str], *, input_type: str
+        ) -> dict[str, list[list[float]]]:
+            captured["batch_embed"] = input_type
+            return {}
+
+        def prepare_chunks(
+            self, _id_resource_dict: dict[str, str], *, input_type: str
+        ) -> dict[str, list[str]]:
+            captured["prepare_chunks"] = input_type
+            return {}
+
+        def truncate_to_token_limit(
+            self, text: str, *, input_type: str
+        ) -> tuple[str, int]:
+            captured["truncate_to_token_limit"] = input_type
+            return text, 1
+
+    wrapper = EmbeddingClient()
+    monkeypatch.setattr(wrapper, "_get_client", lambda: FakeInner())
+
+    await wrapper.embed("q", input_type="document")
+    await wrapper.simple_batch_embed(["d"], input_type="query")
+    await wrapper.batch_embed({"a": "d"}, input_type="query")
+    wrapper.prepare_chunks({"a": "d"}, input_type="query")
+    wrapper.truncate_to_token_limit("q", input_type="document")
+
+    assert captured == {
+        "embed": "document",
+        "simple_batch_embed": "query",
+        "batch_embed": "query",
+        "prepare_chunks": "query",
+        "truncate_to_token_limit": "document",
+    }
+
+
+def test_templates_parse_from_env_verbatim(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Newlines and `<|...|>` markers must survive config loading unchanged."""
+    s = _build_embedding_settings(
+        {
+            "EMBEDDING_MODEL_CONFIG__QUERY_PREFIX": QUERY_PREFIX,
+            "EMBEDDING_MODEL_CONFIG__QUERY_SUFFIX": QUERY_SUFFIX,
+            "EMBEDDING_MODEL_CONFIG__DOCUMENT_PREFIX": DOCUMENT_PREFIX,
+            "EMBEDDING_MODEL_CONFIG__DOCUMENT_SUFFIX": DOCUMENT_SUFFIX,
+        },
+        monkeypatch,
+    )
+
+    resolved = resolve_embedding_model_config(s.MODEL_CONFIG)
+
+    assert resolved.query_prefix == QUERY_PREFIX
+    assert resolved.query_suffix == QUERY_SUFFIX
+    assert resolved.document_prefix == DOCUMENT_PREFIX
+    assert resolved.document_suffix == DOCUMENT_SUFFIX
+    # Defaults stay empty, so OpenAI/Gemini deployments are untouched.
+    default = resolve_embedding_model_config(
+        _build_embedding_settings({}, monkeypatch).MODEL_CONFIG
+    )
+    assert (default.query_prefix, default.query_suffix) == ("", "")
+    assert (default.document_prefix, default.document_suffix) == ("", "")

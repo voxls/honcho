@@ -619,7 +619,13 @@ class TestCreateObservations:
         ) -> list[list[float]]:
             raise RuntimeError("embedding provider timeout")
 
-        async def succeed_single_embed(_content: str) -> list[float]:
+        async def succeed_single_embed(
+            _content: str, *, input_type: str
+        ) -> list[float]:
+            # The fallback embeds stored observations, so it must ask for the
+            # document side or it lands in a different vector space than the
+            # batch path it is standing in for.
+            assert input_type == "document"
             return [0.1, 0.2, 0.3]
 
         created_documents: list[Any] = []
@@ -680,7 +686,10 @@ class TestCreateObservations:
         ) -> list[list[float]]:
             raise RuntimeError("embedding provider timeout")
 
-        async def embed_per_observation(content: str) -> list[float]:
+        async def embed_per_observation(
+            content: str, *, input_type: str
+        ) -> list[float]:
+            assert input_type == "document"
             if content == "Fails embed":
                 raise RuntimeError("single-item embed failure")
             return [0.1, 0.2, 0.3]
@@ -1204,7 +1213,8 @@ class TestSearchMemory:
         query_embeddings: list[list[float] | None] = []
         fallback_embeddings: list[list[float] | None] = []
 
-        async def fake_embed(query: str) -> list[float]:
+        async def fake_embed(query: str, *, input_type: str) -> list[float]:
+            assert input_type == "query"
             embed_calls.append(query)
             return [0.1, 0.2, 0.3]
 
@@ -1307,7 +1317,8 @@ class TestSearchMessages:
         ctx = make_tool_context()
         seen_limits: list[int] = []
 
-        async def fake_embed(query: str) -> list[float]:
+        async def fake_embed(query: str, *, input_type: str) -> list[float]:
+            assert input_type == "query"
             _ = query
             return [0.1, 0.2, 0.3]
 
@@ -1476,7 +1487,8 @@ class TestSearchMessagesTemporal:
         embed_calls: list[str] = []
         forwarded_embeddings: list[list[float] | None] = []
 
-        async def fake_embed(query: str) -> list[float]:
+        async def fake_embed(query: str, *, input_type: str) -> list[float]:
+            assert input_type == "query"
             embed_calls.append(query)
             return [0.9, 0.1, 0.3]
 

@@ -259,7 +259,9 @@ class DialecticAgent:
                 parent_category="dialectic",
                 session_id=self.session_id,
             ):
-                query_embedding = await embedding_client.embed(query)
+                query_embedding = await embedding_client.embed(
+                    query, input_type="query"
+                )
 
             # Prefetched conclusions never pass through the tool executor, so
             # they are recorded here or not at all -- and on a query that

@@ -824,9 +824,9 @@ class TestSessionContextWithScope:
         default_embed = mock_embed.side_effect
         held_during_embed: list[bool] = []
 
-        def recording_embed(query: str) -> list[float]:
+        def recording_embed(query: str, **kwargs: object) -> list[float]:
             held_during_embed.append(db_session.in_transaction())
-            return default_embed(query)
+            return default_embed(query, **kwargs)
 
         mock_embed.side_effect = recording_embed
 

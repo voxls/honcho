@@ -390,7 +390,9 @@ async def search(
                 workspace_name=workspace_name,
                 parent_category="api",
             ):
-                query_embedding = await embedding_client.embed(query)
+                query_embedding = await embedding_client.embed(
+                    query, input_type="query"
+                )
         except EmbeddingTokenLimitError as e:
             raise ValidationException(
                 f"Query exceeds maximum token limit of {settings.EMBEDDING.MAX_INPUT_TOKENS}."

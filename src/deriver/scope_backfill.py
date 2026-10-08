@@ -329,7 +329,7 @@ async def _copy_chunk(
             session_name,
         )
         embeddings = await embedding_client.simple_batch_embed(
-            [spec.content for spec in missing]
+            [spec.content for spec in missing], input_type="document"
         )
         for spec, embedding in zip(missing, embeddings, strict=True):
             spec.embedding = embedding

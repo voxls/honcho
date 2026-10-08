@@ -26,6 +26,11 @@ logger = logging.getLogger(__name__)
 
 _T = TypeVar("_T")
 
+# Which side of a retrieval pair a text belongs to. Asymmetric embedding models
+# want a different instruction template for each; symmetric ones ignore the
+# distinction entirely (all template fields default to empty).
+InputType = Literal["query", "document"]
+
 
 async def _emit_embedding_call(
     *,
@@ -185,7 +190,14 @@ class EmbeddingTokenLimitError(ValueError):
 
 
 class BatchItem(NamedTuple):
-    """A single item in a batch with its metadata."""
+    """A single item in a batch with its metadata.
+
+    `text` is the raw text, never the templated form: chunking and
+    `prepare_chunks` deal in raw text, and the template is applied once at the
+    provider-call boundary, so persisted chunks never contain template text.
+    `token_count` is what the provider receives, template included, so the
+    per-request token cap and telemetry reflect the real payload.
+    """
 
     text: str
     text_id: str
@@ -270,6 +282,62 @@ class _EmbeddingClient:
             self.encoding = tiktoken.get_encoding("cl100k_base")
         self.max_embedding_tokens_per_request: int = max_tokens_per_request
 
+        # (prefix, suffix) wrapped around every input at the provider-call
+        # boundary. Models that expect a chat template and use last-token
+        # pooling (Qwen3-Embedding, Qwen3-VL-Embedding) need both halves; a
+        # prefix alone leaves the pooled token in the wrong place.
+        self._wrappers: dict[InputType, tuple[str, str]] = {
+            "query": (config.query_prefix, config.query_suffix),
+            "document": (config.document_prefix, config.document_suffix),
+        }
+        # The template is sent to the provider but is not part of the text being
+        # chunked or truncated, so its tokens are reserved out of the per-input
+        # budget; otherwise a text that only just fits would overflow once
+        # wrapped and the provider would cut off the suffix.
+        self._wrapper_tokens: dict[InputType, int] = {
+            input_type: self._count_template_tokens(prefix)
+            + self._count_template_tokens(suffix)
+            for input_type, (prefix, suffix) in self._wrappers.items()
+        }
+        for input_type, overhead in self._wrapper_tokens.items():
+            if self._budget(input_type) <= 0:
+                raise ValueError(
+                    f"Embedding {input_type} template uses {overhead} tokens, "
+                    + "leaving no room for input within the embedding token "
+                    + f"limit of {self.max_embedding_tokens}. Shorten "
+                    + f"{input_type}_prefix/{input_type}_suffix or raise "
+                    + "EMBEDDING_MAX_INPUT_TOKENS."
+                )
+
+    def _count_template_tokens(self, template: str) -> int:
+        # Templates may carry special-token markers such as `<|im_start|>`;
+        # count them as ordinary text rather than letting tiktoken reject them.
+        if not template:
+            return 0
+        return len(self.encoding.encode(template, disallowed_special=()))
+
+    def _budget(self, input_type: InputType) -> int:
+        """Per-input token budget net of the template for `input_type`."""
+        return self.max_embedding_tokens - self._wrapper_tokens[input_type]
+
+    def _wrap(self, texts: list[str], input_type: InputType) -> list[str]:
+        """Apply the configured template; a no-op when none is configured."""
+        prefix, suffix = self._wrappers[input_type]
+        if not prefix and not suffix:
+            return texts
+        return [prefix + text + suffix for text in texts]
+
+    def _limit_message(self, input_type: InputType) -> str:
+        budget = self._budget(input_type)
+        overhead = self._wrapper_tokens[input_type]
+        if not overhead:
+            return f"maximum token limit of {budget} tokens"
+        return (
+            f"maximum token limit of {budget} tokens "
+            + f"({self.max_embedding_tokens} minus {overhead} reserved for the "
+            + f"{input_type} template)"
+        )
+
     @property
     def provider(self) -> str:
         return self.transport
@@ -305,13 +373,25 @@ class _EmbeddingClient:
                 + f"Expected {expected}, got {received}."
             )
 
-    async def embed(self, query: str) -> list[float]:
+    async def embed(
+        self, query: str, *, input_type: InputType = "query"
+    ) -> list[float]:
+        """Embed a single text.
+
+        Defaults to `input_type="query"` because that is what nearly every
+        caller wants; pass `"document"` when embedding stored content through
+        this path (for example a single-item fallback around
+        `simple_batch_embed`), so both paths land in the same vector space.
+        """
         token_count = len(self.encoding.encode(query))
 
-        if token_count > self.max_embedding_tokens:
+        if token_count > self._budget(input_type):
             raise EmbeddingTokenLimitError(
-                f"Query exceeds maximum token limit of {self.max_embedding_tokens} tokens (got {token_count} tokens)"
+                f"Query exceeds {self._limit_message(input_type)} (got {token_count} tokens)"
             )
+
+        wrapped = self._wrap([query], input_type)[0]
+        wrapped_token_count = token_count + self._wrapper_tokens[input_type]
 
         # Dispatch on transport rather than isinstance so this module never
         # needs the SDK types at runtime; the cast gives the closures a typed
@@ -324,7 +404,7 @@ class _EmbeddingClient:
                 # are unresolved without Pillow; this call only sends text.
                 response = await gemini_client.aio.models.embed_content(  # pyright: ignore[reportUnknownMemberType]
                     model=self.model,
-                    contents=query,
+                    contents=wrapped,
                     config={"output_dimensionality": self.vector_dimensions},
                 )
                 if not response.embeddings or not response.embeddings[0].values:
@@ -337,14 +417,14 @@ class _EmbeddingClient:
                 provider=self.transport,
                 model=self.model,
                 texts=[query],
-                input_tokens_estimate=token_count,
+                input_tokens_estimate=wrapped_token_count,
                 fn=_call_gemini,
             )
 
         openai_client = cast("AsyncOpenAI", self.client)
 
         async def _call_openai() -> list[float]:
-            openai_kwargs: dict[str, Any] = {"model": self.model, "input": [query]}
+            openai_kwargs: dict[str, Any] = {"model": self.model, "input": [wrapped]}
             self._apply_encoding_format(openai_kwargs)
             if self.send_dimensions:
                 openai_kwargs["dimensions"] = self.vector_dimensions
@@ -356,18 +436,25 @@ class _EmbeddingClient:
             provider=self.transport,
             model=self.model,
             texts=[query],
-            input_tokens_estimate=token_count,
+            input_tokens_estimate=wrapped_token_count,
             fn=_call_openai,
         )
 
-    def truncate_to_token_limit(self, text: str) -> tuple[str, int]:
+    def truncate_to_token_limit(
+        self, text: str, *, input_type: InputType = "query"
+    ) -> tuple[str, int]:
         """Return a prefix of `text` whose re-encoded token count fits the cap.
+
+        The cap is the budget net of the `input_type` template, so the template
+        (in particular its suffix) still fits once applied. The returned text
+        and count are raw, without the template.
 
         Decode/re-encode after slicing: BPE boundaries can re-expand past the cap.
         """
+        budget = self._budget(input_type)
         token_ids = self.encoding.encode(text)
-        keep = self.max_embedding_tokens
-        while len(token_ids) > self.max_embedding_tokens:
+        keep = budget
+        while len(token_ids) > budget:
             keep = min(keep, len(token_ids) - 1)
             if keep < 1:
                 return "", 0
@@ -381,6 +468,7 @@ class _EmbeddingClient:
         texts: list[str],
         *,
         on_oversize: Literal["raise", "truncate"] = "raise",
+        input_type: InputType = "document",
     ) -> list[list[float]]:
         """
         Batch-embed a list of text strings. Does not sub-chunk oversized inputs.
@@ -392,6 +480,9 @@ class _EmbeddingClient:
             texts: List of text strings to embed
             on_oversize: ``"raise"`` (default) errors; ``"truncate"`` embeds a
                 token-capped prefix.
+            input_type: Which side of a retrieval pair these texts are. Defaults
+                to "document"; pass "query" when batching search queries, so
+                they get the same treatment as a single `embed()` call.
 
         Returns:
             List of embedding vectors, one per input text (in order)
@@ -404,14 +495,17 @@ class _EmbeddingClient:
             return []
 
         # Validate / cap per-input token limit and collect counts for batching
+        budget = self._budget(input_type)
         prepared_texts: list[str] = []
         token_counts: list[int] = []
         for idx, text in enumerate(texts):
             token_ids = self.encoding.encode(text)
-            if len(token_ids) > self.max_embedding_tokens:
+            if len(token_ids) > budget:
                 if on_oversize == "truncate":
                     original_count = len(token_ids)
-                    text, tokens = self.truncate_to_token_limit(text)
+                    text, tokens = self.truncate_to_token_limit(
+                        text, input_type=input_type
+                    )
                     logger.warning(
                         "truncated oversize embedding input at idx %d: %d->%d tokens",
                         idx,
@@ -420,8 +514,8 @@ class _EmbeddingClient:
                     )
                 else:
                     raise EmbeddingTokenLimitError(
-                        f"Text at index {idx} exceeds maximum token limit of "
-                        + f"{self.max_embedding_tokens} tokens (got {len(token_ids)} tokens)"
+                        f"Text at index {idx} exceeds "
+                        + f"{self._limit_message(input_type)} (got {len(token_ids)} tokens)"
                     )
             else:
                 tokens = len(token_ids)
@@ -434,9 +528,9 @@ class _EmbeddingClient:
             for i in range(len(prepared_texts))
         }
 
-        batches = self._create_batches(text_chunks)
+        batches = self._create_batches(text_chunks, input_type=input_type)
         batch_results = await asyncio.gather(
-            *[self._process_batch(batch) for batch in batches],
+            *[self._process_batch(batch, input_type=input_type) for batch in batches],
         )
 
         combined: dict[str, list[list[float]]] = self._accumulate_embeddings(
@@ -444,27 +538,35 @@ class _EmbeddingClient:
         )
         return [combined[str(i)][0] for i in range(len(texts))]
 
-    def prepare_chunks(self, id_resource_dict: dict[str, str]) -> dict[str, list[str]]:
+    def prepare_chunks(
+        self, id_resource_dict: dict[str, str], *, input_type: InputType = "document"
+    ) -> dict[str, list[str]]:
         """
         Public helper: tokenize and chunk texts using the same rules as
         `batch_embed()`. Returns ordered chunk texts per input id.
 
         Intended for callers that want to persist embeddable chunks
-        before later embedding them off the request path.
+        before later embedding them off the request path. Chunks are sized to
+        leave room for the `input_type` template but are returned without it;
+        the template is applied when they are embedded.
         """
         return {
             text_id: [chunk_text for chunk_text, _ in chunks]
-            for text_id, chunks in self._prepare_chunks(id_resource_dict).items()
+            for text_id, chunks in self._prepare_chunks(
+                id_resource_dict, input_type=input_type
+            ).items()
         }
 
     async def batch_embed(
-        self, id_resource_dict: dict[str, str]
+        self, id_resource_dict: dict[str, str], *, input_type: InputType = "document"
     ) -> dict[str, list[list[float]]]:
         """
         Embed multiple texts, chunking long ones and batching API calls.
 
         Args:
             id_resource_dict: Maps text IDs to text content
+            input_type: Which side of a retrieval pair these texts are.
+                Defaults to "document", which is what this path is for.
 
         Returns:
             Maps text IDs to lists of embedding vectors (one per chunk)
@@ -473,62 +575,77 @@ class _EmbeddingClient:
             return {}
 
         # 1. Prepare chunks for all texts if needed
-        text_chunks = self._prepare_chunks(id_resource_dict)
+        text_chunks = self._prepare_chunks(id_resource_dict, input_type=input_type)
 
         # 2. Create batches that fit API limits (max 2048 embeddings per request, max 300,000 tokens per request)
-        batches = self._create_batches(text_chunks)
+        batches = self._create_batches(text_chunks, input_type=input_type)
 
         # 3. Process all batches concurrently
         batch_results = await asyncio.gather(
-            *[self._process_batch(batch) for batch in batches],
+            *[self._process_batch(batch, input_type=input_type) for batch in batches],
         )
 
         # 4. Accumulate results preserving chunk order
         return self._accumulate_embeddings(batch_results)
 
     def _prepare_chunks(
-        self, id_resource_dict: dict[str, str]
+        self, id_resource_dict: dict[str, str], *, input_type: InputType = "document"
     ) -> dict[str, list[tuple[str, int]]]:
         """
         Chunk texts that exceed token limits.
+
+        Chunk sizes are computed against the budget net of the template, so
+        every chunk still fits once wrapped at call time. The chunk text itself
+        stays unwrapped.
 
         Args:
             id_resource_dict: Maps text IDs to text content. We tokenize with
                 the embedding client's own encoding so token IDs match the
                 decoder vocabulary used by the target embedding API.
+            input_type: Which side of a retrieval pair these texts are; selects
+                which template to reserve budget for.
 
         Returns:
-            Maps text IDs to lists of (chunk_text, token_count) tuples
+            Maps text IDs to lists of (chunk_text, raw_token_count) tuples
         """
+        budget = self._budget(input_type)
         out: dict[str, list[tuple[str, int]]] = {}
         for text_id, text in id_resource_dict.items():
             tokens = self.encoding.encode(text)
-            if len(tokens) > self.max_embedding_tokens:
+            if len(tokens) > budget:
                 out[text_id] = _chunk_text_with_tokens(
-                    text, tokens, self.max_embedding_tokens, self.encoding
+                    text, tokens, budget, self.encoding
                 )
             else:
                 out[text_id] = [(text, len(tokens))]
         return out
 
     def _create_batches(
-        self, text_chunks: dict[str, list[tuple[str, int]]]
+        self,
+        text_chunks: dict[str, list[tuple[str, int]]],
+        *,
+        input_type: InputType = "document",
     ) -> list[list[BatchItem]]:
         """
         Group chunks into batches that fit API limits.
 
         Args:
-            text_chunks: Maps text IDs to lists of (chunk_text, token_count) tuples
+            text_chunks: Maps text IDs to lists of (chunk_text, raw_token_count)
+                tuples
+            input_type: Selects the template whose tokens are added to each
+                chunk, so the per-request cap counts what is actually sent
 
         Returns:
             List of batches, each containing BatchItem objects
         """
+        overhead = self._wrapper_tokens[input_type]
         batches: list[list[BatchItem]] = []
         current_batch: list[BatchItem] = []
         current_tokens = 0
 
         for text_id, chunks in text_chunks.items():
-            for chunk_idx, (chunk_text, chunk_tokens) in enumerate(chunks):
+            for chunk_idx, (chunk_text, raw_tokens) in enumerate(chunks):
+                chunk_tokens = raw_tokens + overhead
                 # Check if adding this chunk would exceed limits
                 would_exceed_tokens = (
                     current_tokens + chunk_tokens
@@ -552,7 +669,11 @@ class _EmbeddingClient:
         return batches
 
     async def _process_batch(
-        self, batch: list[BatchItem], max_retries: int = 3
+        self,
+        batch: list[BatchItem],
+        max_retries: int = 3,
+        *,
+        input_type: InputType = "document",
     ) -> dict[str, dict[int, list[float]]]:
         """
         Process a single batch through the embeddings API with retry logic.
@@ -560,11 +681,13 @@ class _EmbeddingClient:
         Args:
             batch: List of BatchItem objects to embed
             max_retries: Maximum number of retry attempts (default: 3)
+            input_type: Which template to wrap this batch's texts in
 
         Returns:
             Maps text IDs to {chunk_index: embedding_vector} dictionaries
         """
         last_exception: Exception | None = None
+        wrapped_texts = self._wrap([item.text for item in batch], input_type)
 
         async def _call_provider() -> dict[str, dict[int, list[float]]]:
             """One provider call. Lifted out of the retry loop so
@@ -584,8 +707,8 @@ class _EmbeddingClient:
                     # into a single document by gemini-embedding-2*, which
                     # returns one embedding for the whole batch (#745).
                     contents=[
-                        genai_types.Content(parts=[genai_types.Part(text=item.text)])
-                        for item in batch
+                        genai_types.Content(parts=[genai_types.Part(text=text)])
+                        for text in wrapped_texts
                     ],
                     config={"output_dimensionality": self.vector_dimensions},
                 )
@@ -598,7 +721,7 @@ class _EmbeddingClient:
             else:  # openai
                 openai_kwargs: dict[str, Any] = {
                     "model": self.model,
-                    "input": [item.text for item in batch],
+                    "input": wrapped_texts,
                 }
                 self._apply_encoding_format(openai_kwargs)
                 if self.send_dimensions:
@@ -766,6 +889,10 @@ class EmbeddingClient:
             runtime_config.api_key,
             runtime_config.base_url,
             runtime_config.max_batch_size,
+            runtime_config.query_prefix,
+            runtime_config.query_suffix,
+            runtime_config.document_prefix,
+            runtime_config.document_suffix,
             settings.EMBEDDING.VECTOR_DIMENSIONS,
             settings.EMBEDDING.MAX_INPUT_TOKENS,
             settings.EMBEDDING.MAX_TOKENS_PER_REQUEST,
@@ -773,34 +900,47 @@ class EmbeddingClient:
             settings.EMBEDDING.resolve_encoding_format(),
         )
 
-    async def embed(self, query: str) -> list[float]:
-        """Embed a single query string."""
-        return await self._get_client().embed(query)
+    async def embed(
+        self, query: str, *, input_type: InputType = "query"
+    ) -> list[float]:
+        """Embed a single string. Defaults to the query side."""
+        return await self._get_client().embed(query, input_type=input_type)
 
     async def simple_batch_embed(
         self,
         texts: list[str],
         *,
         on_oversize: Literal["raise", "truncate"] = "raise",
+        input_type: InputType = "document",
     ) -> list[list[float]]:
         """Batch embed a list of text strings (each must fit token limit)."""
         return await self._get_client().simple_batch_embed(
-            texts, on_oversize=on_oversize
+            texts, on_oversize=on_oversize, input_type=input_type
         )
 
-    def prepare_chunks(self, id_resource_dict: dict[str, str]) -> dict[str, list[str]]:
+    def prepare_chunks(
+        self, id_resource_dict: dict[str, str], *, input_type: InputType = "document"
+    ) -> dict[str, list[str]]:
         """Chunk texts using the same rules as `batch_embed` (no network)."""
-        return self._get_client().prepare_chunks(id_resource_dict)
+        return self._get_client().prepare_chunks(
+            id_resource_dict, input_type=input_type
+        )
 
-    def truncate_to_token_limit(self, text: str) -> str:
+    def truncate_to_token_limit(
+        self, text: str, *, input_type: InputType = "query"
+    ) -> str:
         """Truncate text to the embedding token cap (no network)."""
-        return self._get_client().truncate_to_token_limit(text)[0]
+        return self._get_client().truncate_to_token_limit(text, input_type=input_type)[
+            0
+        ]
 
     async def batch_embed(
-        self, id_resource_dict: dict[str, str]
+        self, id_resource_dict: dict[str, str], *, input_type: InputType = "document"
     ) -> dict[str, list[list[float]]]:
         """Embed multiple texts, chunking long ones and batching API calls."""
-        return await self._get_client().batch_embed(id_resource_dict)
+        return await self._get_client().batch_embed(
+            id_resource_dict, input_type=input_type
+        )
 
     @property
     def provider(self) -> str:

@@ -1417,14 +1417,17 @@ def test_oversized_search_query_is_truncated_before_embedding(
     mock_embed = mock_openai_embeddings["embed"]
     default_embed = mock_embed.side_effect
 
-    def strict_embed(query: str) -> list[float]:
+    def strict_embed(query: str, *, input_type: str) -> list[float]:
+        assert input_type == "query"
         if len(query) > limit:
             raise EmbeddingTokenLimitError("too long")
         return default_embed(query)
 
     mock_embed.side_effect = strict_embed
 
-    def truncate(text: str) -> str:
+    def truncate(text: str, *, input_type: str) -> str:
+        # Truncated to the query-side budget, matching the embed() that follows.
+        assert input_type == "query"
         return text[:limit]
 
     mock_openai_embeddings["truncate_to_token_limit"].side_effect = truncate
@@ -1432,7 +1435,7 @@ def test_oversized_search_query_is_truncated_before_embedding(
     response = _get_search_context(client, test_workspace, test_peer, route, long_query)
 
     assert response.status_code == 200
-    mock_embed.assert_called_once_with(long_query[:limit])
+    mock_embed.assert_called_once_with(long_query[:limit], input_type="query")
 
 
 @pytest.mark.parametrize("route", ["peer_context", "peer_representation", "session"])
