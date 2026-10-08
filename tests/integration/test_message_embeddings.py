@@ -728,7 +728,7 @@ async def test_message_chunking_creates_multiple_embeddings(
     chunk_texts = ["chunk-a", "chunk-b", "chunk-c"]
 
     def mock_prepare_chunks_chunked(
-        id_resource_dict: dict[str, str],
+        id_resource_dict: dict[str, str], **_kwargs: object
     ) -> dict[str, list[str]]:
         return {text_id: list(chunk_texts) for text_id in id_resource_dict}
 

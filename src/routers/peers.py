@@ -503,14 +503,16 @@ async def get_representation(
                 # Truncate oversized user queries instead of dropping semantic
                 # search; embed() stays strict so agent queries still fail.
                 options.search_query = embedding_client.truncate_to_token_limit(
-                    options.search_query
+                    options.search_query, input_type="query"
                 )
                 with embedding_call_purpose(
                     EmbeddingCallPurpose.SEARCH_MEMORY.value,
                     workspace_name=workspace_id,
                     parent_category="api",
                 ):
-                    embedding = await embedding_client.embed(options.search_query)
+                    embedding = await embedding_client.embed(
+                        options.search_query, input_type="query"
+                    )
             except Exception:
                 # Swallowed on purpose (see include_semantic_query below), but not
                 # silently: without this a provider outage degrades every search
@@ -742,8 +744,12 @@ async def get_peer_context(
             ):
                 # Truncate oversized user queries instead of dropping semantic
                 # search; embed() stays strict so agent queries still fail.
-                search_query = embedding_client.truncate_to_token_limit(search_query)
-                embedding = await embedding_client.embed(search_query)
+                search_query = embedding_client.truncate_to_token_limit(
+                    search_query, input_type="query"
+                )
+                embedding = await embedding_client.embed(
+                    search_query, input_type="query"
+                )
 
         # Get the working representation
         representation = await crud.get_working_representation(

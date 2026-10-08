@@ -962,8 +962,10 @@ async def get_session_context(
         ):
             # Truncate oversized user queries instead of dropping semantic
             # search; embed() stays strict so agent queries still fail.
-            search_query = embedding_client.truncate_to_token_limit(search_query)
-            embedding = await embedding_client.embed(search_query)
+            search_query = embedding_client.truncate_to_token_limit(
+                search_query, input_type="query"
+            )
+            embedding = await embedding_client.embed(search_query, input_type="query")
 
     # The allowlist recall must respect, whichever way the caller expressed it.
     # `sessions` and `limit_to_session` are mutually exclusive (422 above), so at

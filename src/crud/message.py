@@ -474,7 +474,9 @@ async def create_messages(
             if message_obj.content and message_obj.content.strip()
         }
         if id_resource_dict:
-            chunks_by_id = embedding_client.prepare_chunks(id_resource_dict)
+            chunks_by_id = embedding_client.prepare_chunks(
+                id_resource_dict, input_type="document"
+            )
             peer_by_id = {m.public_id: m.peer_name for m in message_objects}
             pending_rows: list[models.MessageEmbedding] = []
             for message_obj in message_objects:
@@ -998,7 +1000,7 @@ async def search_messages(
             EmbeddingCallPurpose.SEARCH_MESSAGES.value,
             workspace_name=workspace_name,
         ):
-            query_embedding = await embedding_client.embed(query)
+            query_embedding = await embedding_client.embed(query, input_type="query")
     return await _semantic_search_messages(
         workspace_name,
         session_name,
@@ -1217,7 +1219,7 @@ async def search_messages_temporal(
             EmbeddingCallPurpose.SEARCH_MESSAGES.value,
             workspace_name=workspace_name,
         ):
-            query_embedding = await embedding_client.embed(query)
+            query_embedding = await embedding_client.embed(query, input_type="query")
     return await _semantic_search_messages(
         workspace_name,
         session_name,

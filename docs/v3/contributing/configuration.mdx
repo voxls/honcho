@@ -272,6 +272,15 @@ EMBEDDING_MODEL_CONFIG__TIMEOUT=90.0       # optional client HTTP timeout (secon
 # Optional endpoint overrides
 EMBEDDING_MODEL_CONFIG__OVERRIDES__BASE_URL=http://localhost:8000/v1
 EMBEDDING_MODEL_CONFIG__OVERRIDES__API_KEY_ENV=EMBEDDING_CUSTOM_API_KEY
+
+# Optional per-side input templates (asymmetric models only)
+EMBEDDING_MODEL_CONFIG__QUERY_PREFIX=
+EMBEDDING_MODEL_CONFIG__QUERY_SUFFIX=
+EMBEDDING_MODEL_CONFIG__DOCUMENT_PREFIX=
+EMBEDDING_MODEL_CONFIG__DOCUMENT_SUFFIX=
+
+# Semantic deduplication threshold for new conclusions
+EMBEDDING_SEMANTIC_DEDUP_MAX_DISTANCE=0.05
 ```
 
 `EMBEDDING_MODEL_CONFIG__MAX_BATCH_SIZE` defaults to 2048 for OpenAI. For
@@ -286,6 +295,38 @@ seconds. OpenAI-compatible transports receive it as the SDK `timeout` kwarg
 milliseconds on `http_options.timeout`, and keeps its existing 10-minute
 default when unset. The value is validated at config load the same way as
 LLM `provider_params.timeout` (positive, finite number of seconds).
+
+#### Embedding templates for asymmetric models
+
+Some embedding models expect each input wrapped in an instruction template, and a different one for the text being searched *for* (a query) than for the text being searched *through* (a stored message or conclusion). Honcho sends every input as `prefix + text + suffix`, choosing the query or document pair by what the text is:
+
+- **Query side**: search queries from the API (`search_query`, message search), the dialectic agent's memory and message searches.
+- **Document side**: message chunks, conclusions, and anything the reconciler or scope backfill embeds.
+
+All four settings are empty by default, which sends the raw text exactly as before. Leave them unset for OpenAI and Gemini models, and set them only when your model is trained for templates. Templates are model-specific, so changing them (or switching models) means re-embedding existing data. See [Changing Embeddings](./changing-embeddings).
+
+Template tokens count against `EMBEDDING_MAX_INPUT_TOKENS`. Honcho reserves room for them before it checks, truncates, or chunks text, so the suffix is never cut off. Stored message chunks never include template text. If a template leaves no room for input, every embedding call fails with an error that names the template.
+
+Models that use last-token pooling over a chat template, such as Qwen3-Embedding and Qwen3-VL-Embedding, need the suffix as well as the prefix. Without it the pooled token lands on the input text rather than the assistant turn, and retrieval quality drops. Example:
+
+```bash
+EMBEDDING_MODEL_CONFIG__QUERY_PREFIX="<|im_start|>system\nGiven a search query, retrieve relevant memories or conversation messages that help answer it.<|im_end|>\n<|im_start|>user\n"
+EMBEDDING_MODEL_CONFIG__QUERY_SUFFIX="<|im_end|>\n<|im_start|>assistant\n"
+EMBEDDING_MODEL_CONFIG__DOCUMENT_PREFIX="<|im_start|>system\nRepresent the user's input.<|im_end|>\n<|im_start|>user\n"
+EMBEDDING_MODEL_CONFIG__DOCUMENT_SUFFIX="<|im_end|>\n<|im_start|>assistant\n"
+EMBEDDING_SEMANTIC_DEDUP_MAX_DISTANCE=0.03
+```
+
+Each `\n` above must reach Honcho as a real newline. Honcho uses the values exactly as given and does not process escapes itself, so how you supply them matters:
+
+- **`.env` file**: double-quoted values, as above. python-dotenv turns `\n` into a newline.
+- **`config.toml`**: basic (double-quoted) strings under `[embedding.model_config]`, e.g. `query_suffix = "<|im_end|>\n<|im_start|>assistant\n"`.
+- **Kubernetes ConfigMap or Compose YAML**: double-quoted YAML strings, which also turn `\n` into a newline. Single-quoted and plain YAML scalars keep `\n` as two literal characters.
+- **Shell**: `export VAR=$'...\n...'`. A plain `"...\n..."` in bash or zsh keeps the backslash.
+
+#### Semantic deduplication threshold
+
+When the deriver saves a conclusion, Honcho compares it with its nearest existing conclusion in the same scope. A cosine distance at or below `EMBEDDING_SEMANTIC_DEDUP_MAX_DISTANCE` counts as a duplicate. The default, `0.05`, is calibrated for `text-embedding-3-small`. Other models spread their similarities differently, so calibrate this per model: with the templated Qwen3-VL-Embedding setup above, `0.03` gives about the same duplicate rate and precision as `0.05` does for OpenAI.
 
 Forwarding `dimensions=` to OpenAI-compatible providers is controlled by `EMBEDDING_MODEL_CONFIG__DIMENSIONS_MODE`:
 

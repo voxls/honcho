@@ -606,11 +606,11 @@ def mock_openai_embeddings(request: pytest.FixtureRequest):
         patch("src.embedding_client.embedding_client.batch_embed") as mock_batch_embed,
         patch(
             "src.embedding_client.embedding_client.truncate_to_token_limit",
-            side_effect=lambda text: text,  # pyright: ignore[reportUnknownLambdaType]
+            side_effect=lambda text, **_kwargs: text,  # pyright: ignore[reportUnknownLambdaType]
         ) as mock_truncate,
     ):
         # Mock the embed method to return content-dependent embedding
-        def embed_side_effect(content: str) -> list[float]:
+        def embed_side_effect(content: str, **_kwargs: object) -> list[float]:
             return _content_to_embedding(content)
 
         mock_embed.side_effect = embed_side_effect
@@ -623,7 +623,7 @@ def mock_openai_embeddings(request: pytest.FixtureRequest):
         mock_simple_batch_embed.side_effect = mock_simple_batch_embed_func
 
         def mock_prepare_chunks_func(
-            id_resource_dict: dict[str, str],
+            id_resource_dict: dict[str, str], **_kwargs: object
         ) -> dict[str, list[str]]:
             # No real tokenizer in mocks: treat each input as a single chunk.
             return {text_id: [text] for text_id, text in id_resource_dict.items()}
@@ -632,7 +632,7 @@ def mock_openai_embeddings(request: pytest.FixtureRequest):
 
         # Mock the batch_embed method to return content-dependent embeddings
         async def mock_batch_embed_func(
-            id_resource_dict: dict[str, str],
+            id_resource_dict: dict[str, str], **_kwargs: object
         ) -> dict[str, list[list[float]]]:
             return {
                 text_id: [_content_to_embedding(content)]

@@ -124,7 +124,7 @@ class RepresentationManager:
                 parent_category="representation",
             ):
                 embeddings = await embedding_client.simple_batch_embed(
-                    observation_texts, on_oversize="truncate"
+                    observation_texts, on_oversize="truncate", input_type="document"
                 )
         except EmbeddingTokenLimitError as e:
             raise exceptions.ValidationException(
@@ -284,7 +284,9 @@ class RepresentationManager:
                     parent_category=parent_category,
                 ),
             ):
-                embedding = await embedding_client.embed(include_semantic_query)
+                embedding = await embedding_client.embed(
+                    include_semantic_query, input_type="query"
+                )
 
         if db is not None:
             return await self._get_working_representation_internal(

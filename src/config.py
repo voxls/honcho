@@ -396,6 +396,16 @@ class ConfiguredEmbeddingModelSettings(BaseModel):
     max_batch_size: Annotated[int, Field(gt=0)] | None = None
     # Client HTTP timeout in seconds. OpenAI receives seconds; Gemini converts to ms.
     timeout: float | None = None
+    # Per-side input templates for asymmetric embedding models. Each input is
+    # sent as `prefix + text + suffix`; the raw text is what gets chunked and
+    # persisted. Models that pool the last token of a chat template (Qwen3-
+    # Embedding, Qwen3-VL-Embedding) need the suffix as well as the prefix.
+    # Empty by default, so models that take raw text (OpenAI's, Gemini's) are
+    # unaffected. Values are used verbatim: no stripping or escape processing.
+    query_prefix: str = ""
+    query_suffix: str = ""
+    document_prefix: str = ""
+    document_suffix: str = ""
 
     @field_validator("timeout", mode="before")
     @classmethod
@@ -442,6 +452,11 @@ class EmbeddingModelConfig(BaseModel):
     max_batch_size: Annotated[int, Field(gt=0)] | None = None
     # Client HTTP timeout in seconds. OpenAI receives seconds; Gemini converts to ms.
     timeout: float | None = None
+    # See ConfiguredEmbeddingModelSettings.
+    query_prefix: str = ""
+    query_suffix: str = ""
+    document_prefix: str = ""
+    document_suffix: str = ""
 
     @field_validator("timeout", mode="before")
     @classmethod
@@ -575,6 +590,10 @@ def resolve_embedding_model_config(
         base_url=configured.overrides.base_url,
         max_batch_size=configured.max_batch_size,
         timeout=configured.timeout,
+        query_prefix=configured.query_prefix,
+        query_suffix=configured.query_suffix,
+        document_prefix=configured.document_prefix,
+        document_suffix=configured.document_suffix,
     )
 
 
@@ -830,6 +849,11 @@ class EmbeddingSettings(HonchoSettings):
     # saturated, message creation skips the fast path entirely and the
     # reconciler embeds on its next cycle. 0 disables the fast path.
     MAX_PENDING_EMBED_TASKS: Annotated[int, Field(default=50, ge=0)] = 50
+    # Cosine distance at or below which a new conclusion is treated as a semantic
+    # duplicate of its nearest neighbour. Model-dependent: calibrate per embedding model.
+    SEMANTIC_DEDUP_MAX_DISTANCE: Annotated[
+        float, Field(default=0.05, ge=0.0, le=1.0)
+    ] = 0.05
 
     @model_validator(mode="before")
     @classmethod

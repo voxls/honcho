@@ -233,7 +233,8 @@ def _uses_pgvector() -> bool:
 
 
 # Shared by is_rejected_duplicate and create_documents candidate resolution.
-_SEMANTIC_DUP_MAX_DISTANCE = 0.05
+# The distance threshold is settings.EMBEDDING.SEMANTIC_DEDUP_MAX_DISTANCE,
+# read at call time because it is calibrated per embedding model.
 _SEMANTIC_DUP_TOP_K = 1
 _SEMANTIC_CANDIDATE_CONCURRENCY = 8
 
@@ -416,7 +417,7 @@ async def query_documents(
     # Use provided embedding or generate one
     if embedding is None:
         try:
-            embedding = await embedding_client.embed(query)
+            embedding = await embedding_client.embed(query, input_type="query")
         except EmbeddingTokenLimitError as e:
             raise ValidationException(
                 "Query exceeds maximum token limit of "
@@ -616,7 +617,7 @@ async def create_documents(
                             observed=observed,
                             embedding=doc.embedding,
                             top_k=_SEMANTIC_DUP_TOP_K,
-                            max_distance=_SEMANTIC_DUP_MAX_DISTANCE,
+                            max_distance=settings.EMBEDDING.SEMANTIC_DEDUP_MAX_DISTANCE,
                             filters=filters,
                         )
                     except Exception:
@@ -1141,7 +1142,7 @@ async def create_observations(
     contents = [obs.content for obs in observations]
     try:
         embeddings = await embedding_client.simple_batch_embed(
-            contents, on_oversize="truncate"
+            contents, on_oversize="truncate", input_type="document"
         )
     except EmbeddingTokenLimitError as e:
         raise ValidationException(str(e)) from e
@@ -1457,7 +1458,7 @@ async def _pgvector_dup_candidates(
             .where(models.Document.observed == observed)
             .where(models.Document.embedding.isnot(None))
             .where(models.Document.deleted_at.is_(None))
-            .where(distance <= _SEMANTIC_DUP_MAX_DISTANCE)
+            .where(distance <= settings.EMBEDDING.SEMANTIC_DEDUP_MAX_DISTANCE)
         )
         leg = apply_filter(leg, models.Document, filters)
         nearest = leg.order_by(distance).limit(_SEMANTIC_DUP_TOP_K).subquery()
@@ -1560,7 +1561,7 @@ async def _semantic_dup_decision(
             observer=observer,
             observed=observed,
             filters=filters,
-            max_distance=_SEMANTIC_DUP_MAX_DISTANCE,
+            max_distance=settings.EMBEDDING.SEMANTIC_DEDUP_MAX_DISTANCE,
             top_k=_SEMANTIC_DUP_TOP_K,
             embedding=doc.embedding,
         )

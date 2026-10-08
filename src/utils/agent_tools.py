@@ -905,7 +905,7 @@ async def create_observations(
             parent_category=parent_category,
         ):
             embeddings = await embedding_client.simple_batch_embed(
-                contents, on_oversize="truncate"
+                contents, on_oversize="truncate", input_type="document"
             )
         embeddings_by_index = dict(
             zip(range(len(normalized_observations)), embeddings, strict=True)
@@ -930,7 +930,9 @@ async def create_observations(
                     run_id=run_id,
                     parent_category=parent_category,
                 ):
-                    embedding = await embedding_client.embed(obs.content)
+                    embedding = await embedding_client.embed(
+                        obs.content, input_type="document"
+                    )
             except Exception as e:
                 logger.warning(
                     "Error embedding observation content for level '%s': %s",
@@ -1655,7 +1657,7 @@ async def _handle_search_memory(
             run_id=ctx.run_id,
             parent_category=ctx.parent_category,
         ):
-            query_embedding = await embedding_client.embed(query)
+            query_embedding = await embedding_client.embed(query, input_type="query")
     except EmbeddingTokenLimitError:
         return (
             "ERROR: Query exceeds maximum token limit of "
@@ -1802,7 +1804,7 @@ async def _handle_search_messages(
         run_id=ctx.run_id,
         parent_category=ctx.parent_category,
     ):
-        query_embedding = await embedding_client.embed(query)
+        query_embedding = await embedding_client.embed(query, input_type="query")
     snippets = await crud.search_messages(
         workspace_name=ctx.workspace_name,
         session_name=ctx.session_name,
@@ -1983,7 +1985,7 @@ async def _handle_search_messages_temporal(
         run_id=ctx.run_id,
         parent_category=ctx.parent_category,
     ):
-        query_embedding = await embedding_client.embed(query)
+        query_embedding = await embedding_client.embed(query, input_type="query")
     snippets = await crud.search_messages_temporal(
         workspace_name=ctx.workspace_name,
         session_name=ctx.session_name,

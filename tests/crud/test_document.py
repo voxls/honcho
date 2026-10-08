@@ -10,6 +10,7 @@ from sqlalchemy.exc import OperationalError
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
 from src import crud, models, schemas
+from src.config import settings
 from src.crud.document import SemanticRejectionResult, is_rejected_duplicate
 from src.exceptions import ResourceNotFoundException
 from src.utils.types import DocumentLevel
@@ -1047,7 +1048,9 @@ class TestDocumentCRUD:
 
         assert len(created) == 2
         mock_embed.assert_awaited_once_with(
-            ["short conclusion", "another conclusion"], on_oversize="truncate"
+            ["short conclusion", "another conclusion"],
+            on_oversize="truncate",
+            input_type="document",
         )
 
 
@@ -2422,7 +2425,7 @@ class TestPgvectorCandidateEquivalence:
                 observed_peer.name,
                 doc.embedding,
                 filters,
-                document_module._SEMANTIC_DUP_MAX_DISTANCE,  # pyright: ignore[reportPrivateUsage]
+                settings.EMBEDDING.SEMANTIC_DEDUP_MAX_DISTANCE,
                 document_module._SEMANTIC_DUP_TOP_K,  # pyright: ignore[reportPrivateUsage]
             )
             expected.append([row.id for row in reference])
@@ -2641,3 +2644,158 @@ class TestExternalCandidateEquivalence:
             )
             # Pinned independently too, or two equally broken scopes would agree.
             assert batched_key == expected_key, f"case {index}"
+
+
+class TestSemanticDedupDistance:
+    """The dedup cutoff is `settings.EMBEDDING.SEMANTIC_DEDUP_MAX_DISTANCE`.
+
+    It is calibrated per embedding model, so both the single-document path
+    (`is_rejected_duplicate`) and the batched one used by `create_documents`
+    (`_pgvector_dup_candidates`) must read it at call time.
+    """
+
+    DIM: int = 1536
+
+    @staticmethod
+    def _at_distance(distance: float) -> list[float]:
+        """Unit vector whose cosine distance from the axis-0 unit vector is
+        exactly `distance`."""
+        cos = 1.0 - distance
+        vector = [0.0] * TestSemanticDedupDistance.DIM
+        vector[0] = cos
+        vector[1] = (1.0 - cos**2) ** 0.5
+        return vector
+
+    async def _setup(
+        self,
+        db_session: AsyncSession,
+        test_workspace: models.Workspace,
+        test_peer: models.Peer,
+    ) -> tuple[models.Peer, models.Session]:
+        observed_peer = models.Peer(
+            name=str(generate_nanoid()), workspace_name=test_workspace.name
+        )
+        session = models.Session(
+            name=str(generate_nanoid()), workspace_name=test_workspace.name
+        )
+        db_session.add_all([observed_peer, session])
+        await db_session.flush()
+        db_session.add(
+            models.Collection(
+                workspace_name=test_workspace.name,
+                observer=test_peer.name,
+                observed=observed_peer.name,
+            )
+        )
+        await db_session.flush()
+        db_session.add(
+            models.Document(
+                workspace_name=test_workspace.name,
+                observer=test_peer.name,
+                observed=observed_peer.name,
+                session_name=session.name,
+                content="the user drinks oat-milk lattes every single morning",
+                embedding=self._at_distance(0.0),
+                level="explicit",
+                internal_metadata={},
+            )
+        )
+        await db_session.commit()
+        return observed_peer, session
+
+    def _incoming(
+        self, distance: float, session: models.Session
+    ) -> schemas.DocumentCreate:
+        # Fewer unique tokens than the stored row, so a match is REJECTED
+        # rather than replacing it.
+        return schemas.DocumentCreate(
+            content="the user drinks lattes",
+            embedding=self._at_distance(distance),
+            session_name=session.name,
+            level="explicit",
+            metadata=schemas.DocumentMetadata(
+                message_ids=[1],
+                message_created_at="2026-01-01T00:00:00Z",
+            ),
+        )
+
+    @pytest.mark.parametrize(
+        ("max_distance", "distance", "expected"),
+        [
+            (0.03, 0.04, SemanticRejectionResult.NOT_DUPLICATE),
+            (0.03, 0.02, SemanticRejectionResult.REJECTED),
+            (None, 0.04, SemanticRejectionResult.REJECTED),
+        ],
+    )
+    @pytest.mark.asyncio
+    async def test_is_rejected_duplicate_honours_configured_distance(
+        self,
+        db_session: AsyncSession,
+        sample_data: tuple[models.Workspace, models.Peer],
+        monkeypatch: pytest.MonkeyPatch,
+        max_distance: float | None,
+        distance: float,
+        expected: SemanticRejectionResult,
+    ):
+        if max_distance is not None:
+            monkeypatch.setattr(
+                settings.EMBEDDING, "SEMANTIC_DEDUP_MAX_DISTANCE", max_distance
+            )
+        else:
+            assert settings.EMBEDDING.SEMANTIC_DEDUP_MAX_DISTANCE == 0.05
+        monkeypatch.setattr(settings.VECTOR_STORE, "TYPE", "pgvector")
+
+        test_workspace, test_peer = sample_data
+        observed_peer, session = await self._setup(
+            db_session, test_workspace, test_peer
+        )
+
+        result = await is_rejected_duplicate(
+            db_session,
+            self._incoming(distance, session),
+            test_workspace.name,
+            observer=test_peer.name,
+            observed=observed_peer.name,
+        )
+
+        assert result is expected
+
+    @pytest.mark.parametrize(
+        ("max_distance", "distance", "is_candidate"),
+        [
+            (0.03, 0.04, False),
+            (0.03, 0.02, True),
+            (None, 0.04, True),
+        ],
+    )
+    @pytest.mark.asyncio
+    async def test_batched_candidates_honour_configured_distance(
+        self,
+        db_session: AsyncSession,
+        sample_data: tuple[models.Workspace, models.Peer],
+        monkeypatch: pytest.MonkeyPatch,
+        max_distance: float | None,
+        distance: float,
+        is_candidate: bool,
+    ):
+        from src.crud import document as document_module
+
+        if max_distance is not None:
+            monkeypatch.setattr(
+                settings.EMBEDDING, "SEMANTIC_DEDUP_MAX_DISTANCE", max_distance
+            )
+
+        test_workspace, test_peer = sample_data
+        observed_peer, session = await self._setup(
+            db_session, test_workspace, test_peer
+        )
+
+        candidates = await document_module._pgvector_dup_candidates(  # pyright: ignore[reportPrivateUsage]
+            db_session,
+            [self._incoming(distance, session)],
+            test_workspace.name,
+            observer=test_peer.name,
+            observed=observed_peer.name,
+        )
+
+        assert (len(candidates[0]) == 1) is is_candidate

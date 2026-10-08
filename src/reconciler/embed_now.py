@@ -220,7 +220,7 @@ async def _embed_chunks(claimed: list[_ClaimedChunk]) -> list[list[float]] | Non
                 parent_category="api",
             ):
                 return await embedding_client.simple_batch_embed(
-                    [c.content for c in claimed]
+                    [c.content for c in claimed], input_type="document"
                 )
     except Exception:
         logger.exception(

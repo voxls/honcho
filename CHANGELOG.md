@@ -5,6 +5,13 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](http://keepachangelog.com/)
 and this project adheres to [Semantic Versioning](http://semver.org/).
 
+## Unreleased (fork)
+
+### Added
+
+- Per-side input templates for asymmetric embedding models. `EMBEDDING_MODEL_CONFIG__QUERY_PREFIX` / `__QUERY_SUFFIX` / `__DOCUMENT_PREFIX` / `__DOCUMENT_SUFFIX` wrap each input as `prefix + text + suffix`: search queries get the query pair, and stored messages and conclusions get the document pair. The suffix is what chat-template models with last-token pooling (Qwen3-Embedding, Qwen3-VL-Embedding) need. Template tokens are reserved out of `EMBEDDING_MAX_INPUT_TOKENS` before checking, truncating, or chunking, so the suffix is never cut off. Stored chunks stay unwrapped. All four default to empty, which sends the same bytes as before. Builds on plastic-labs/honcho#951, which added prefixes only
+- `EMBEDDING_SEMANTIC_DEDUP_MAX_DISTANCE` (default `0.05`) replaces the hard-coded cosine distance used to detect duplicate conclusions, so it can be calibrated per embedding model
+
 ## [3.3.0] - 2026-10-07
 
 ### Added

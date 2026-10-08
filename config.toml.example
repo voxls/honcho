@@ -72,6 +72,9 @@ OPENAI_API_KEY = "your-api-key-here"
 VECTOR_DIMENSIONS = 1536
 MAX_INPUT_TOKENS = 8192
 MAX_TOKENS_PER_REQUEST = 300000
+# Cosine distance at or below which a new conclusion is a semantic duplicate of
+# its nearest neighbour. Model-specific: 0.05 suits text-embedding-3-small.
+SEMANTIC_DEDUP_MAX_DISTANCE = 0.05
 
 [embedding.model_config]
 transport = "openai"
@@ -81,6 +84,14 @@ model = "text-embedding-3-small"
 # max_batch_size = 10
 # Optional client HTTP timeout in seconds (OpenAI + Gemini).
 # timeout = 90.0
+# Optional per-side input templates for asymmetric embedding models: every
+# input is sent as prefix + text + suffix. Leave unset for models that take raw
+# text (OpenAI, Gemini). TOML basic strings turn "\n" into a real newline.
+# Example for Qwen3-Embedding / Qwen3-VL-Embedding:
+# query_prefix = "<|im_start|>system\nGiven a search query, retrieve relevant memories or conversation messages that help answer it.<|im_end|>\n<|im_start|>user\n"
+# query_suffix = "<|im_end|>\n<|im_start|>assistant\n"
+# document_prefix = "<|im_start|>system\nRepresent the user's input.<|im_end|>\n<|im_start|>user\n"
+# document_suffix = "<|im_end|>\n<|im_start|>assistant\n"
 
 # Optional module-level endpoint overrides
 # [embedding.model_config.overrides]

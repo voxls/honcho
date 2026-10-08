@@ -559,7 +559,7 @@ class TestRepresentationManagerSave:
 
         assert len(saved.created_documents) == 1
         mock_embed.assert_awaited_once_with(
-            ["useful observation"], on_oversize="truncate"
+            ["useful observation"], on_oversize="truncate", input_type="document"
         )
         saved_observations = _saved_observations(mock_save)
         assert len(saved_observations) == 1
@@ -617,7 +617,7 @@ class TestRepresentationManagerSave:
 
         assert len(saved.created_documents) == 1
         mock_embed.assert_awaited_once_with(
-            ["inferred conclusion"], on_oversize="truncate"
+            ["inferred conclusion"], on_oversize="truncate", input_type="document"
         )
         saved_observations = _saved_observations(mock_save)
         assert len(saved_observations) == 1
@@ -731,6 +731,7 @@ class TestRepresentationManagerSave:
                 "ran 'cat /proc/1/environ | tr '' '\\n''",
             ],
             on_oversize="truncate",
+            input_type="document",
         )
 
         saved_observations = _saved_observations(mock_save)
@@ -841,7 +842,9 @@ class TestRepresentationManagerSave:
             )
 
         mock_embed.assert_awaited_once_with(
-            ["inferred fact", "short fact"], on_oversize="truncate"
+            ["inferred fact", "short fact"],
+            on_oversize="truncate",
+            input_type="document",
         )
 
 

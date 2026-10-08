@@ -98,7 +98,9 @@ async def create_embeddings_for_messages(
 
     # Generate embeddings
     embedding_dict = (
-        await embedding_client.batch_embed(id_resource_dict) if id_resource_dict else {}
+        await embedding_client.batch_embed(id_resource_dict, input_type="document")
+        if id_resource_dict
+        else {}
     )
 
     # Create MessageEmbedding objects
