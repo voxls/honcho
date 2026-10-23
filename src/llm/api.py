@@ -35,6 +35,7 @@ from .runtime import (
 )
 from .tool_loop import execute_tool_loop
 from .types import (
+    BudgetLine,
     HonchoLLMCallResponse,
     HonchoLLMCallStreamChunk,
     IterationCallback,
@@ -63,6 +64,7 @@ async def honcho_llm_call(
     thinking_budget_tokens: int | None = None,
     enable_retry: bool = True,
     retry_attempts: int = 3,
+    validate_response: Callable[[HonchoLLMCallResponse[Any]], None] | None = None,
     stream: Literal[False] = False,
     stream_final_only: bool = False,
     tools: list[dict[str, Any]] | None = None,
@@ -71,6 +73,8 @@ async def honcho_llm_call(
     max_tool_iterations: int = 10,
     force_tools_until: Collection[str] | None = None,
     max_forced_iterations: int = 3,
+    budget_line: BudgetLine | None = None,
+    final_call_tools: list[dict[str, Any]] | None = None,
     messages: list[dict[str, Any]] | None = None,
     max_input_tokens: int | None = None,
     trace_name: str | None = None,
@@ -95,6 +99,7 @@ async def honcho_llm_call(
     thinking_budget_tokens: int | None = None,
     enable_retry: bool = True,
     retry_attempts: int = 3,
+    validate_response: Callable[[HonchoLLMCallResponse[Any]], None] | None = None,
     stream: Literal[False] = False,
     stream_final_only: bool = False,
     tools: list[dict[str, Any]] | None = None,
@@ -103,6 +108,8 @@ async def honcho_llm_call(
     max_tool_iterations: int = 10,
     force_tools_until: Collection[str] | None = None,
     max_forced_iterations: int = 3,
+    budget_line: BudgetLine | None = None,
+    final_call_tools: list[dict[str, Any]] | None = None,
     messages: list[dict[str, Any]] | None = None,
     max_input_tokens: int | None = None,
     trace_name: str | None = None,
@@ -127,6 +134,7 @@ async def honcho_llm_call(
     thinking_budget_tokens: int | None = None,
     enable_retry: bool = True,
     retry_attempts: int = 3,
+    validate_response: Callable[[HonchoLLMCallResponse[Any]], None] | None = None,
     stream: Literal[True] = ...,
     stream_final_only: bool = False,
     tools: list[dict[str, Any]] | None = None,
@@ -135,6 +143,8 @@ async def honcho_llm_call(
     max_tool_iterations: int = 10,
     force_tools_until: Collection[str] | None = None,
     max_forced_iterations: int = 3,
+    budget_line: BudgetLine | None = None,
+    final_call_tools: list[dict[str, Any]] | None = None,
     messages: list[dict[str, Any]] | None = None,
     max_input_tokens: int | None = None,
     trace_name: str | None = None,
@@ -158,6 +168,7 @@ async def honcho_llm_call(
     thinking_budget_tokens: int | None = None,
     enable_retry: bool = True,
     retry_attempts: int = 3,
+    validate_response: Callable[[HonchoLLMCallResponse[Any]], None] | None = None,
     stream: bool = False,
     stream_final_only: bool = False,
     tools: list[dict[str, Any]] | None = None,
@@ -166,6 +177,8 @@ async def honcho_llm_call(
     max_tool_iterations: int = 10,
     force_tools_until: Collection[str] | None = None,
     max_forced_iterations: int = 3,
+    budget_line: BudgetLine | None = None,
+    final_call_tools: list[dict[str, Any]] | None = None,
     messages: list[dict[str, Any]] | None = None,
     max_input_tokens: int | None = None,
     trace_name: str | None = None,
@@ -185,6 +198,13 @@ async def honcho_llm_call(
     A caller-supplied `run` stays owned by the caller; otherwise the call opens
     and ends its own around the tool loop.
 
+    `validate_response` runs on each attempt's response inside the retried
+    call, so raising from it consumes an attempt exactly like a provider error:
+    it is retried and reaches the fallback on the final attempt (with
+    `enable_retry=False`, the first raise propagates). It sees the response
+    before call-level fields such as `hit_input_token_cap` are set. Tool-less,
+    non-streaming calls only.
+
     Raises:
         ValidationException: If streaming and tool calling are combined
                              without `stream_final_only=True`.
@@ -203,6 +223,11 @@ async def honcho_llm_call(
             "Streaming is not supported with tool calling. "
             + "Set stream=False when using tools, or use stream_final_only=True "
             + "to stream only the final response after tool calls."
+        )
+
+    if validate_response is not None and (stream or (tools and tool_executor)):
+        raise ValidationException(
+            "validate_response is only supported on tool-less, non-streaming calls"
         )
 
     # tenacity uses 1-indexed attempts.
@@ -249,7 +274,7 @@ async def honcho_llm_call(
                 plan=plan,
                 telemetry=telemetry,
             )
-        return await honcho_llm_call_inner(
+        response = await honcho_llm_call_inner(
             plan.provider,
             plan.model,
             prompt,
@@ -269,6 +294,9 @@ async def honcho_llm_call(
             plan=plan,
             telemetry=telemetry,
         )
+        if validate_response is not None:
+            validate_response(response)
+        return response
 
     decorated = _call_with_provider_selection
 
@@ -384,7 +412,7 @@ async def honcho_llm_call(
                         telemetry=telemetry,
                         messages=captured_messages,
                     )
-                return await honcho_llm_call_inner(
+                response = await honcho_llm_call_inner(
                     plan.provider,
                     plan.model,
                     prompt,
@@ -405,6 +433,9 @@ async def honcho_llm_call(
                     telemetry=telemetry,
                     messages=captured_messages,
                 )
+                if validate_response is not None:
+                    validate_response(response)
+                return response
 
             wrapped = _toolless_call
             if sentry_track_name:
@@ -468,6 +499,8 @@ async def honcho_llm_call(
             max_tool_iterations=max_tool_iterations,
             force_tools_until=force_tools_until,
             max_forced_iterations=max_forced_iterations,
+            budget_line=budget_line,
+            final_call_tools=final_call_tools,
             response_model=response_model,
             json_mode=json_mode,
             temperature=temperature,
