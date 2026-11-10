@@ -383,7 +383,7 @@ class _EmbeddingClient:
         this path (for example a single-item fallback around
         `simple_batch_embed`), so both paths land in the same vector space.
         """
-        token_count = len(self.encoding.encode(query))
+        token_count = len(self.encoding.encode(query, disallowed_special=()))
 
         if token_count > self._budget(input_type):
             raise EmbeddingTokenLimitError(
@@ -452,14 +452,14 @@ class _EmbeddingClient:
         Decode/re-encode after slicing: BPE boundaries can re-expand past the cap.
         """
         budget = self._budget(input_type)
-        token_ids = self.encoding.encode(text)
+        token_ids = self.encoding.encode(text, disallowed_special=())
         keep = budget
         while len(token_ids) > budget:
             keep = min(keep, len(token_ids) - 1)
             if keep < 1:
                 return "", 0
             text = self.encoding.decode(token_ids[:keep])
-            token_ids = self.encoding.encode(text)
+            token_ids = self.encoding.encode(text, disallowed_special=())
             keep -= 1
         return text, len(token_ids)
 
@@ -499,7 +499,7 @@ class _EmbeddingClient:
         prepared_texts: list[str] = []
         token_counts: list[int] = []
         for idx, text in enumerate(texts):
-            token_ids = self.encoding.encode(text)
+            token_ids = self.encoding.encode(text, disallowed_special=())
             if len(token_ids) > budget:
                 if on_oversize == "truncate":
                     original_count = len(token_ids)
@@ -611,7 +611,7 @@ class _EmbeddingClient:
         budget = self._budget(input_type)
         out: dict[str, list[tuple[str, int]]] = {}
         for text_id, text in id_resource_dict.items():
-            tokens = self.encoding.encode(text)
+            tokens = self.encoding.encode(text, disallowed_special=())
             if len(tokens) > budget:
                 out[text_id] = _chunk_text_with_tokens(
                     text, tokens, budget, self.encoding
