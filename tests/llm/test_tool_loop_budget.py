@@ -143,15 +143,17 @@ async def test_hit_iteration_limit_only_when_the_loop_runs_out() -> None:
 
 
 class _RecordingModel(_ScriptedModel):
-    """Also records the tools offered on each call."""
+    """Also records the tools offered and the tool choice sent on each call."""
 
     def __init__(self, turns: list[list[str]]) -> None:
         super().__init__(turns)
         self.tools_offered: list[list[str] | None] = []
+        self.tool_choices: list[Any] = []
 
     async def __call__(self, *args: Any, **kwargs: Any) -> HonchoLLMCallResponse[Any]:
         tools = kwargs.get("tools")
         self.tools_offered.append([t["name"] for t in tools] if tools else None)
+        self.tool_choices.append(kwargs.get("tool_choice"))
         return await super().__call__(*args, **kwargs)
 
 
@@ -214,10 +216,35 @@ async def test_final_call_offers_only_the_final_call_tools_and_runs_them() -> No
 
 
 @pytest.mark.asyncio
-async def test_final_call_has_no_tools_by_default() -> None:
-    model = _RecordingModel([["look"], ["look"]])
-    await _run(model, max_tool_iterations=1)
-    assert model.tools_offered[-1] is None
+async def test_final_call_keeps_the_loop_tools_and_forbids_their_use() -> None:
+    """The final call sends the tool list the loop used, so the request keeps the
+    prefix the provider cached, and `tool_choice` none makes the model answer."""
+    model = _RecordingModel([["look"], []])
+    response = await _run(model, max_tool_iterations=1)
+    assert isinstance(response, HonchoLLMCallResponse)
+
+    assert model.tools_offered == [["look"], ["look"]]
+    assert model.tool_choices == [None, "none"]
+    assert model.seen[1][: len(model.seen[0])] == model.seen[0]
+    assert response.content == "done"
+    assert response.hit_iteration_limit is True
+
+
+@pytest.mark.asyncio
+async def test_final_call_repeats_without_tools_if_a_tool_is_called_anyway() -> None:
+    """A provider that ignores `tool_choice` none must not cost the answer: the
+    forbidden call is not executed, and the model is asked again with no tools."""
+    model = _RecordingModel([["look"], ["look"], []])
+    response = await _run(model, max_tool_iterations=1)
+    assert isinstance(response, HonchoLLMCallResponse)
+
+    assert model.tools_offered == [["look"], ["look"], None]
+    assert model.tool_choices == [None, "none", None]
+    assert response.content == "done"
+    # Only the loop's own call ran; the one made on the final call did not.
+    assert [tc["tool_name"] for tc in response.tool_calls_made] == ["look"]
+    # All three provider calls are paid for, the ignored one included.
+    assert (response.input_tokens, response.output_tokens) == (30, 15)
 
 
 @pytest.mark.asyncio
