@@ -163,16 +163,31 @@ async def _run_loop(
 
 
 @pytest.mark.asyncio
-async def test_synthesis_drops_thinking_for_preserved_thinking_model() -> None:
+async def test_synthesis_keeps_thinking_because_the_tool_set_is_unchanged() -> None:
     calls, _ = await _run_loop(
         "claude-sonnet-5-5", [_tool_call_turn("t1"), _answer()], max_tool_iterations=1
     )
 
     synthesis = calls[-1]
-    assert synthesis["tools"] is None
-    assert _thinking_blocks_in(synthesis["messages"]) == 0
-    # The turn's tool call survives the strip.
-    assistant = synthesis["messages"][1]
+    assert synthesis["tools"] == [SEARCH_TOOL]
+    assert _thinking_blocks_in(synthesis["messages"]) == 1
+
+
+@pytest.mark.asyncio
+async def test_synthesis_repeated_without_tools_drops_thinking() -> None:
+    """When the model calls a tool on the synthesis call anyway, the repeat has
+    no tools, which no earlier thinking block was produced under."""
+    calls, _ = await _run_loop(
+        "claude-sonnet-5-5",
+        [_tool_call_turn("t1"), _tool_call_turn("t2"), _answer()],
+        max_tool_iterations=1,
+    )
+
+    repeat = calls[-1]
+    assert [call["tools"] for call in calls] == [[SEARCH_TOOL], [SEARCH_TOOL], None]
+    assert _thinking_blocks_in(repeat["messages"]) == 0
+    # The loop's tool call survives the strip.
+    assistant = repeat["messages"][1]
     assert isinstance(assistant, AIMessage)
     assert [call.id for call in assistant.tool_calls] == ["t1"]
 

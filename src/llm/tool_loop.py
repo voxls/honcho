@@ -484,9 +484,16 @@ async def execute_tool_loop(
       5. Repeat until the LLM stops calling tools or max iterations reached
 
     When the iteration limit is reached, one final call is made. By default
-    it offers no tools, so the model must answer. With `final_call_tools`, it
-    offers those tools instead (for an agent whose output is its writes), and
-    any calls it makes are executed; no further call follows them.
+    it keeps the loop's tools and forbids their use (`tool_choice="none"`), so
+    the model must answer while the request still shares its prefix with the
+    loop's earlier calls: tool definitions sit at the start of the prompt, and
+    a request without them reuses nothing from the provider's prompt cache. A
+    provider that lets the model call a tool anyway gets the call repeated
+    with no tools on offer. The streamed final call offers no tools, since a
+    streamed tool call could not be recovered from. With `final_call_tools`,
+    the final call offers those tools instead (for an agent whose output is
+    its writes), and any calls it makes are executed; no further call follows
+    them.
 
     Each iteration and the final call retry under `retry_condition`, which
     the caller builds with `llm_retry_condition` for its model config.
@@ -849,14 +856,20 @@ async def execute_tool_loop(
 
     current_attempt.set(1)
 
-    # The synthesis call offers a different tool set (final_call_tools, or
-    # none), which no earlier thinking block was produced under.
-    if (final_call_tools or None) != tools:
+    # `final_call_tools` is a different tool set, which no earlier thinking
+    # block was produced under. The loop's own tools leave those blocks valid.
+    if final_call_tools and final_call_tools != tools:
         stale_thinking_before = len(conversation_messages)
+    synthesis_tools = final_call_tools or tools or None
+    forbid_tool_use = bool(synthesis_tools) and not final_call_tools
 
-    async def _final_call() -> HonchoLLMCallResponse[Any]:
-        plan = get_attempt_plan()
-        response = await honcho_llm_call_inner(
+    async def _synthesis_call(
+        plan: AttemptPlan,
+        call_tools: list[dict[str, Any]] | None,
+        call_tool_choice: str | None,
+        stale_before: int,
+    ) -> HonchoLLMCallResponse[Any]:
+        return await honcho_llm_call_inner(
             plan.provider,
             plan.model,
             prompt,
@@ -870,17 +883,42 @@ async def execute_tool_loop(
             plan.thinking_budget_tokens,
             stream=False,
             client_override=plan.client,
-            tools=final_call_tools or None,
-            tool_choice=None,
-            messages=_without_stale_thinking(
-                conversation_messages, plan, stale_thinking_before
-            ),
+            tools=call_tools,
+            tool_choice=call_tool_choice,
+            messages=_without_stale_thinking(conversation_messages, plan, stale_before),
             selected_config=plan.selected_config,
             plan=plan,
             telemetry=_telemetry_for_iteration(
                 telemetry, synthesis_iteration, step_seq=synthesis_iteration
             ),
         )
+
+    async def _final_call() -> HonchoLLMCallResponse[Any]:
+        plan = get_attempt_plan()
+        response = await _synthesis_call(
+            plan,
+            synthesis_tools,
+            "none" if forbid_tool_use else None,
+            stale_thinking_before,
+        )
+        if forbid_tool_use and response.tool_calls_made:
+            # The provider let the model call a tool although tool use was
+            # forbidden. Ask again with no tools on offer; that request has a
+            # different tool set, so no earlier thinking block is valid for it.
+            logger.warning(
+                "%s/%s called a tool on the synthesis call despite "
+                + "tool_choice none; repeating the call without tools",
+                plan.provider,
+                plan.model,
+            )
+            ignored = response
+            response = await _synthesis_call(
+                plan, None, None, len(conversation_messages)
+            )
+            response.input_tokens += ignored.input_tokens
+            response.output_tokens += ignored.output_tokens
+            response.cache_creation_input_tokens += ignored.cache_creation_input_tokens
+            response.cache_read_input_tokens += ignored.cache_read_input_tokens
         # No nudge follows synthesis, so an empty answer is a miss too.
         _require_structured_answer(response, response_model, allow_empty=False)
         return response
